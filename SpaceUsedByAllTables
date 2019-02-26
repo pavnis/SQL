@@ -1,0 +1,70 @@
+/*	PROBLEM: FIND SPACE USED BY EACH TABLE IN DATABASE	*/
+
+/*	SOLUTION 1. IF YOU WON'T NEED TO SEPERATE SPACE USED BY DATA AND INDEX	*/
+SELECT
+    S.Name AS [Schema Name],
+	T.NAME AS [Table Name],
+    P.rows AS [Row Count],
+    SUM(AU.total_pages) * 8 AS [Total Space (KB)], 
+    SUM(AU.used_pages) * 8 AS [Used Space (KB)], 
+    (SUM(AU.total_pages) - SUM(AU.used_pages)) * 8 AS [Unused Space (KB)],
+    CAST(ROUND(((SUM(AU.total_pages) * 8) / 1024.00), 2) AS NUMERIC(36, 2)) AS [Total Space (MB)],
+    CAST(ROUND(((SUM(AU.used_pages) * 8) / 1024.00), 2) AS NUMERIC(36, 2)) AS [Used Space (MB)],
+    CAST(ROUND(((SUM(AU.total_pages) - SUM(AU.used_pages)) * 8) / 1024.00, 2) AS NUMERIC(36, 2)) AS [Unused Space (MB)]
+FROM sys.tables T
+	INNER JOIN sys.indexes I ON T.OBJECT_ID = I.object_id
+	INNER JOIN sys.partitions P ON I.object_id = P.OBJECT_ID AND I.index_id = P.index_id
+	INNER JOIN sys.allocation_units AU ON P.partition_id = AU.container_id
+	LEFT OUTER JOIN sys.schemas S ON T.schema_id = S.schema_id
+WHERE T.NAME NOT LIKE 'dt%' 
+    AND T.is_ms_shipped = 0
+    AND I.OBJECT_ID > 255 
+GROUP BY S.Name, T.Name, P.Rows
+ORDER BY T.Name
+
+/*	SOLUTION 2. IF YOU NEED TO SEPERATE SPACE USED BY DATA AND INDEX	*/
+
+SELECT
+    B.name AS [Table Name],
+    A.rows as [Row Count],
+    (A.reserved + ISNULL(D.reserved,0))* 8 AS [Total Space (KB)], 
+    A.data * 8 AS [Total Data Space (KB)],
+    (CASE WHEN (A.used + ISNULL(D.used,0)) > A.data THEN (A.used + ISNULL(D.used,0)) - A.data ELSE 0 END) * 8 AS [Used Index Size (KB)],
+    (CASE WHEN (A.reserved + ISNULL(D.reserved,0)) > A.used THEN (A.reserved + ISNULL(D.reserved,0)) - A.used ELSE 0 END) * 8 AS [Unused Space (KB)],
+	CAST(ROUND(((A.reserved + ISNULL(D.reserved,0))* 8)/1024.00,2)  AS NUMERIC(36, 2)) AS [Total Space (MB)], 
+    CAST(ROUND((A.data * 8)/1024.00,2)  AS NUMERIC(36, 2)) AS [Total Data Space (MB)],
+    CAST(ROUND(((CASE WHEN (A.used + ISNULL(D.used,0)) > A.data THEN (A.used + ISNULL(D.used,0)) - A.data ELSE 0 END) * 8)/1024.00, 2) AS NUMERIC(36, 2)) AS [Used Index Size (MB)],
+    CAST(ROUND(((CASE WHEN (A.reserved + ISNULL(D.reserved,0)) > A.used THEN (A.reserved + ISNULL(D.reserved,0)) - A.used ELSE 0 END) * 8)/1024.00, 2)  AS NUMERIC(36, 2)) AS [Unused Space (MB)]
+FROM
+    (SELECT 
+        ps.object_id,
+        SUM (
+            CASE
+                WHEN (ps.index_id < 2) THEN row_count
+                ELSE 0
+            END
+            ) AS [rows],
+        SUM (ps.reserved_page_count) AS reserved,
+        SUM (
+            CASE
+                WHEN (ps.index_id < 2) THEN (ps.in_row_data_page_count + ps.lob_used_page_count + ps.row_overflow_used_page_count)
+                ELSE (ps.lob_used_page_count + ps.row_overflow_used_page_count)
+            END
+            ) AS data,
+        SUM (ps.used_page_count) AS used
+    FROM sys.dm_db_partition_stats ps
+        WHERE ps.object_id NOT IN (SELECT object_id FROM sys.tables WHERE is_memory_optimized = 1)
+    GROUP BY ps.object_id) AS A
+LEFT OUTER JOIN 
+    (SELECT 
+        it.parent_id,
+        SUM(ps.reserved_page_count) AS reserved,
+        SUM(ps.used_page_count) AS used
+     FROM sys.dm_db_partition_stats ps
+     INNER JOIN sys.internal_tables it ON (it.object_id = ps.object_id)
+     WHERE it.internal_type IN (202,204)
+     GROUP BY it.parent_id) AS D ON (D.parent_id = A.object_id)
+INNER JOIN sys.all_objects B  ON ( A.object_id = B.object_id ) 
+INNER JOIN sys.schemas C ON (B.schema_id = C.schema_id)
+WHERE B.type <> N'S' and B.type <> N'IT'
+ORDER BY C.name, B.name
